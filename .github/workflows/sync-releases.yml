@@ -1,57 +1,56 @@
 # 🔄 GeoIP Releases 自動同步工作流
 # 
-# 將此文件放到你 fork 的 geoip 倉庫的 .github/workflows/ 目錄中
-# 它會自動從上游 Loyalsoldier/geoip 下載最新 Releases 並發布到你的 fork
-#
+# 從上游 Loyalsoldier/geoip 下載最新 Releases 並發布到 Fork
+# 
 # 設置步驟：
-# 1. Fork https://github.com/Loyalsoldier/geoip
-# 2. 在 fork 倉庫中創建 .github/workflows/sync-releases.yml
-# 3. 將此文件內容複製進去
-# 4. 確保倉庫的 Actions 權限已開啟
+# 1. 在 Settings → Actions → General 中啟用 Actions
+# 2. 設置 Workflow permissions 為 "Read and write permissions"
+# 3. 勾選 "Allow GitHub Actions to create and approve pull requests"
 
 name: Sync Releases from Upstream
 
 on:
   schedule:
-    # 每天 UTC 01:00 執行（上游通常在 UTC 00:00 發布）
+    # 每天 UTC 01:00 執行
     - cron: '0 1 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: '強制重新發布（即使版本相同）'
+        description: '強制重新發布'
         required: false
         default: 'false'
 
 env:
   UPSTREAM_REPO: Loyalsoldier/geoip
-  
+
+permissions:
+  contents: write
+
 jobs:
   sync-releases:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       
       - name: Get upstream latest release
         id: upstream
         run: |
+          echo "Fetching upstream release info..."
           RELEASE_INFO=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest")
           TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
-          PUBLISHED=$(echo "$RELEASE_INFO" | jq -r '.published_at')
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "published=$PUBLISHED" >> $GITHUB_OUTPUT
-          echo "📦 Upstream latest: $TAG (published: $PUBLISHED)"
+          echo "📦 Upstream latest: $TAG"
       
-      - name: Check if release exists
+      - name: Check if release exists locally
         id: check
         run: |
           TAG="${{ steps.upstream.outputs.tag }}"
+          echo "Checking if release $TAG exists..."
+          
           EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
           
           if [ "$EXISTS" = "200" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
@@ -68,42 +67,21 @@ jobs:
           mkdir -p release-assets
           TAG="${{ steps.upstream.outputs.tag }}"
           
+          echo "📥 Downloading release assets for $TAG..."
+          
           # 獲取所有 assets
           ASSETS=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" \
             | jq -r '.assets[].browser_download_url')
           
-          echo "📥 Downloading assets..."
           for url in $ASSETS; do
             filename=$(basename "$url")
             echo "  Downloading: $filename"
-            curl -fSL "$url" -o "release-assets/$filename"
+            curl -fSL "$url" -o "release-assets/$filename" || echo "Failed: $filename"
           done
           
+          echo ""
+          echo "Downloaded files:"
           ls -lh release-assets/
-      
-      - name: Sync upstream code
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 添加上游並同步
-          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || true
-          git fetch upstream --tags
-          
-          # 同步 master 分支
-          git checkout master
-          git reset --hard upstream/master
-          git push origin master --force
-          
-          # 同步 release 分支（如果存在）
-          if git ls-remote --heads upstream release | grep -q release; then
-            git checkout -B release upstream/release
-            git push origin release --force
-          fi
-          
-          # 同步標籤
-          git push origin --tags --force
       
       - name: Create release
         if: steps.check.outputs.exists == 'false'
@@ -112,15 +90,20 @@ jobs:
           tag_name: ${{ steps.upstream.outputs.tag }}
           name: ${{ steps.upstream.outputs.tag }}
           body: |
-            🔄 **Synced from upstream**
+            🔄 **自動同步自上游**
             
-            - Source: [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }})
-            - Original release: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.upstream.outputs.tag }}
-            - Synced at: ${{ github.event.repository.updated_at }}
+            - 來源: [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }})
+            - 原始 Release: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.upstream.outputs.tag }}
+            - 同步時間: ${{ github.event.repository.updated_at }}
             
             ---
             
-            This release is automatically synced from the upstream repository.
+            此 Release 由 GitHub Actions 自動從上游同步。
+            
+            **CDN 訪問:**
+            ```
+            https://cdn.jsdmirror.com/gh/${{ github.repository }}@release/Country.mmdb
+            ```
           files: release-assets/*
           draft: false
           prerelease: false
@@ -136,5 +119,11 @@ jobs:
           echo "| Upstream | ${{ env.UPSTREAM_REPO }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tag | ${{ steps.upstream.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Already Exists | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Force | ${{ github.event.inputs.force }} |" >> $GITHUB_STEP_SUMMARY
-
+          
+          if [ "${{ steps.check.outputs.exists }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Downloaded Files" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            ls -lh release-assets/ >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No files" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
